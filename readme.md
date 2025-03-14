@@ -1,0 +1,1 @@
+To use it just open program, and execute the script.

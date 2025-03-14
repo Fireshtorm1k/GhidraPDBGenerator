@@ -12,6 +12,7 @@ import windows.generated_def as windef
 import ctypes
 import pefile
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from ghidra.program.model.listing import Program
 from ghidra.app.util.opinion import PeLoader
 from ghidra.app.util.bin import MemoryByteProvider
 from ghidra.app.services import ConsoleService
+from ghidra.program.model.data import Undefined as GhidraUndefined
 from ghidra.program.model.data import *
 from ghidra.program.model.symbol import SymbolType, NameTransformer
 from ghidra.app.decompiler import DecompInterface, ClangLine, ClangStatement, ClangTokenGroup, PrettyPrinter
@@ -77,6 +79,7 @@ class PEDataExtractor():
     def GetSectionsData(self):
         sectionsData = PdbGeneratorPy.SectionsType()
         
+        #programPath = "d:\\HYSYS 1.1\\hysys.exe"
         programPath = getCurrentProgram().getExecutablePath()[1:]
         pe = pefile.PE(programPath)
         for section in pe.sections:
@@ -90,14 +93,6 @@ class PEDataExtractor():
             coffSection.PointerToLinenumbers = section.PointerToLinenumbers
             coffSection.Characteristics = section.Characteristics
             sectionsData.append(coffSection)
-            print(coffSection.Name)
-            print(coffSection.VirtualSize)
-            print(coffSection.VirtualSize)
-            print(coffSection.SizeOfRawData)
-            print(coffSection.PointerToRawData)
-            print(coffSection.PointerToRelocations)
-            print(coffSection.PointerToLinenumbers)
-            print(coffSection.Characteristics)
             
             
             
@@ -106,6 +101,7 @@ class PEDataExtractor():
             
     def GetPdbInfo(self):
         programPath = getCurrentProgram().getExecutablePath()[1:]
+        #programPath = "d:\\HYSYS 1.1\\hysys.exe"
         pe = pefile.PE(programPath)
         
         for dbg in pe.DIRECTORY_ENTRY_DEBUG:
@@ -204,11 +200,15 @@ class DiscardedRange:
     StartEa: int
     EndEa: int
     PseudoCodeLineNumber: int
-
+def getOutputPath() -> Path:
+    exePath = getCurrentProgram().getExecutablePath()[1:] # Вернет путь к файлу вида C:\\Test\\test.exe
+    outputFolder = os.path.dirname(exePath)
+    return Path(outputFolder)
+    
 class FunctionDataExtractor:
     def __init__(Self, TypeExtractor):
         Self.TypeExtractor = TypeExtractor
-        Self.SourceCodeOutputPath = Path.cwd() / "DecompiledSourceCode"
+        Self.SourceCodeOutputPath = getOutputPath() / "DecompiledSourceCode"
         Self.SourceCodeOutputPath.mkdir(exist_ok=True)
 
     def GetFunctionsData(self):
@@ -233,13 +233,14 @@ class FunctionDataExtractor:
         def GetFunctionDataInternal():
             if function.isThunk():
                 return
-            funcName = function.getName()
-            if funcName != "TestFunc":
-                return
+            funcNameSpace = function.getParentNamespace().getName()
+            if funcNameSpace != "Global" and funcNameSpace is not None:
+                funcName = f"{funcNameSpace}_{function.getName()}"
+            else:
+                funcName = function.getName()
             body = function.getBody()
             function_size = 0
             for addressRange in body:
-                print(addressRange)
                 function_size += addressRange.getLength()
 
             functionData.Size = function_size
@@ -267,8 +268,8 @@ class FunctionDataExtractor:
             decompiledFunction = decompileResults.getDecompiledFunction()
             functionType = function.getSignature()
             self.TypeExtractor.InsertTypeInfoData(functionType)
-            
             functionData.FunctionName = funcName
+            
             functionData.FilePath = self.__CreateFilePath(funcName)
             functionData.TypeName = self.TypeExtractor.GetTypeName(functionType)
             pseudoCode = self.__GetPseudoCode(decompiledFunction.getC())
@@ -278,9 +279,9 @@ class FunctionDataExtractor:
             
             if not functionData.InstructionOffsetToPseudoCodeLine:
                 return
-
+            formattedPseudocode = self.replace_this_only(pseudoCode)
             with open(functionData.FilePath, "wb") as sourceFile:
-                sourceFile.write(bytes(pseudoCode, "utf-8"))
+                sourceFile.write(bytes(formattedPseudocode, "utf-8"))
 
 
         GetFunctionDataInternal()
@@ -292,6 +293,10 @@ class FunctionDataExtractor:
 
     def __GetPseudoCode(self, PseudoCode):
         return PseudoCode
+    
+    def replace_this_only(self,string: str) -> str:
+        pattern = r'\bthis\b'
+        return re.sub(pattern, 'This', string)
 
     def __GetInstructionsOffsetToPseudoCodeLines(self, function, DecompiledFunction, PseudoCodeLines, DecompiledResults):
         instructionOffsetToPseudoCodeLines = PdbGeneratorPy.InstructionsToLines()
@@ -352,18 +357,19 @@ class FunctionDataExtractor:
         return shadowSpaceArguments
 
     def __GetFunctionLocalVariables(self, HighFunction, Function):
-        symbolMap =HighFunction.getLocalSymbolMap()
+        highNames = []
+        symbolMap = HighFunction.getLocalSymbolMap()
+        #lvars = Function.getAllVariables()
         lvars = symbolMap.getSymbols()
+
         if not lvars:
             return PdbGeneratorPy.LocalVariables()
         
         localVariables = self.__GetFunctionShadowSpaceArguments(HighFunction, Function)
+        i = 0
         for lvar in lvars:
             symName = lvar.getName()
-            
-            if lvar.isParameter():
-                continue
-            
+
             if not symName:
                 continue
             
@@ -371,35 +377,50 @@ class FunctionDataExtractor:
             self.TypeExtractor.InsertTypeInfoData(lvar.getDataType())
 
             localVariable = PdbGeneratorPy.LocalVariable()
-            localVariable.Name = lvar.name
+            if symName == "this":
+                symName = "This"
+            localVariable.Name = symName
             localVariable.TypeName = self.TypeExtractor.GetTypeName(lvar.getDataType())
             symStorage = lvar.getStorage()
-            
+
             if symStorage.isRegisterStorage():
-                registryName = symStorage.getRegister().getName()
+                registryName = symStorage.getRegister().getName().lower()
                 if not registryName:
                     continue
                 
                 localVariable.RegistryName = registryName
 
             elif symStorage.isStackStorage():
-                stackOffset = symStorage.getStackOffset() 
-                localVariable.Offset = stackOffset
-                if self.__IsX86_64():
-                    localVariable.RegistryName = "rsp"
+                if Function.getStackFrame():
+                    stackOffset = symStorage.getStackOffset() + 4 
+                    localVariable.Offset = stackOffset
+                    if self.__IsX86_64():
+                        localVariable.RegistryName = "rbp"
+                    else:
+                        localVariable.RegistryName = "ebp"
                 else:
-                    localVariable.RegistryName = "esp"
+                    stackOffset = symStorage.getStackOffset()
+                    localVariable.Offset = stackOffset
+                    if self.__IsX86_64():
+                        localVariable.RegistryName = "rsp"
+                    else:
+                        localVariable.RegistryName = "esp"
             else:
                 continue
-
+            
+            
             localVariables.append(localVariable)
+            i=i+1
 
         return localVariables
 
     def __CreateFilePath(self, FunctionName):
         # Characters '?' and ':' are illegal to use inside file name so replace them
         FunctionName = FunctionName.replace("?", "!")
-        FunctionName = FunctionName.replace("::", "++")
+        FunctionName = FunctionName.replace("::", "+")
+        INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+        if INVALID_FILENAME_CHARS.search(FunctionName):
+            FunctionName = str(uuid.uuid1())
         functionPath = str(self.SourceCodeOutputPath / f"{FunctionName}.c")
         
         # Guard for windows maximum file path
@@ -471,7 +492,6 @@ class FunctionDataExtractor:
                     instructionOffsetToPseudoCodeLines.insert(0, index + 1)
                     break
         '''
-        print(instructionOffsetToPseudoCodeLines)
         return instructionOffsetToPseudoCodeLines
     
     def get_call_instruction_address(self, ranges):
@@ -528,8 +548,6 @@ class TypeExtractor:
             if not isinstance(dt, Enum):
                 continue
             
-            if dt.getDisplayName() != "TestEnum":
-                continue
             enumerators = PdbGeneratorPy.EnumeratorsData()
             for enumName in dt.getNames():
                 enumValue = dt.getValue(enumName)
@@ -554,8 +572,8 @@ class TypeExtractor:
         all_types = ArrayList()
         localTypeLibrary.getAllDataTypes(all_types)
         for dt in all_types:
-            
-            structType = self.__GetStructType(dt)
+            baseType = unwrapTypedef(dt)
+            structType = self.__GetStructType(baseType)
             
             if not structType:
                 continue
@@ -564,10 +582,8 @@ class TypeExtractor:
             size = dt.getLength()
             members = None
             
-            if name == "_EXCEPTION_RECORD":
-                n = 5
                 
-            members = self.__GetStructMembersInfo(dt)
+            members = self.__GetStructMembersInfo(baseType)
                 
             if not members:
                 continue
@@ -627,17 +643,18 @@ class TypeExtractor:
         funcArgs = TypeInfo.getArguments()
         typeData = PdbGeneratorPy.FunctionTypeData()
         typeData.ReturnType = self.GetTypeName(retType)
-        
         self.InsertTypeInfoData(retType)
-        
         for functionArg in funcArgs:
             self.InsertTypeInfoData(functionArg.getDataType())
-            typeData.Parameters.append(self.GetTypeName(functionArg.getDataType()))
+            argument = self.GetTypeName(functionArg.getDataType())
+            typeData.Parameters.append(argument)
 
         self.ComplexTypesData[typeName] = typeData
     
     def __InsertPointerTypeData(self, TypeInfo):
-        pointerTypeData = TypeInfo.getDataType()
+        pointerTypeData = unwrapTypedef(TypeInfo)
+        pointerTypeData = pointerTypeData.getDataType()
+        
         if not pointerTypeData:
             return
 
@@ -647,7 +664,19 @@ class TypeExtractor:
         
         self.InsertTypeInfoData(pointerTypeData)
         typeData = PdbGeneratorPy.PointerTypeData()
-        typeData.ValueType = self.GetTypeName(pointerTypeData)
+        unwrappedTypeData = unwrapTypedef(pointerTypeData)
+        if isinstance(unwrappedTypeData, Pointer):
+            
+            '''baseDataType = unwrappedTypeData.getDataType()
+            if baseDataType:
+                simpleType = self.__GetStructType(baseDataType)
+                if simpleType:
+                    typeData.ValueType = self.GetTypeName(baseDataType)
+                else:'''
+            typeData.ValueType = self.GetTypeName(pointerTypeData)
+                    
+        else:
+            typeData.ValueType = self.GetTypeName(pointerTypeData)
         self.ComplexTypesData[typeName] = typeData
 
         
@@ -698,7 +727,8 @@ class TypeExtractor:
         bitOffset = bitfieldTypeData.getBitOffset()
         bitSize = bitfieldTypeData.getBitSize()
         member = PdbGeneratorPy.MemberData()
-        member.Name = UdtMember.getFieldName()
+        name = UdtMember.getFieldName()
+        member.Name = "field_" + hex(UdtMember.getOffset())+'_'+hex(bitOffset) if name == None else name
         member.TypeName = f"{'unsigned ' if not bitfieldTypeData.getBaseDataType().isSigned() else ''}" + f"__int{nbytes * 8}"
         member.Offset = offset
 
@@ -711,7 +741,9 @@ class TypeExtractor:
     def __CreateSimpleTypeMember(self, UdtMember):
         name = UdtMember.getFieldName()
         member = PdbGeneratorPy.MemberData()
-        member.Name = "unnamed-" + str(uuid.uuid4()) if name == None else name
+        if name == None:
+            n = 2
+        member.Name = "field_" + hex(UdtMember.getOffset()) if name == None else name
         member.TypeName = self.GetTypeName(UdtMember.getDataType())
         member.Offset = UdtMember.getOffset()
         return member
@@ -747,8 +779,19 @@ class TypeExtractor:
         if isinstance(baseType, FunctionDefinition):
             prototypeStr = baseType.getPrototypeString()
             decl = baseType.getCallingConventionName()
-            formattedFuncName = self.__transform_function_declaration(prototypeStr,decl, False)
-            result = formattedFuncName
+            retType = baseType.getReturnType()
+            args = baseType.getArguments()
+            argString = None
+            
+            functionPrototype = f"{retType} {decl}("
+            arg_strings = []
+            for arg in args:
+                arg_str = f"{arg.getDataType().getDisplayName()} {arg.getName()}"
+                arg_strings.append(arg_str)
+                
+            functionPrototype += ", ".join(arg_strings) + ")"
+
+            result = functionPrototype
         
         if baseTypeType != None and isinstance(baseTypeType, FunctionDefinition):
             prototypeStr = baseTypeType.getPrototypeString()
@@ -762,7 +805,7 @@ class TypeExtractor:
                 else:
                     result = simpleType
                     
-        elif isinstance(TypeInfo, TypeDef):
+        elif isinstance(TypeInfo, TypeDef) or self.__GetStructType(TypeInfo):
             finalTypeName = self.get_final_type_name(TypeInfo)
             if finalTypeName:
                 result = finalTypeName
@@ -770,13 +813,11 @@ class TypeExtractor:
                 
         if result == "void *__ptr32":
                 result = "void *"
-        elif self.__GetStructType(baseTypeType):
-            result = self.__InsertUnnamedStructDataAndGetItsName(TypeInfo)
         
         return result
     
     def __GetSimpleType(self, Type):
-        if isinstance(Type, Undefined):
+        if isinstance(Type, GhidraUndefined) or isinstance(Type, DefaultDataType):
             return self.__GetUnknownType(Type)
         elif isinstance(Type, VoidDataType):
             return self.__GetVoidType(Type)
@@ -806,13 +847,15 @@ class TypeExtractor:
         return f"__int{size*8}" 
 
     def __GetBoolType(self, TypeFlags):
-        boolTypes = {
-            ida_typeinf.BTMT_BOOL1: "_BOOL8",
-            ida_typeinf.BTMT_BOOL2: "_BOOL64" if idaapi.inf_is_64bit() else "_BOOL16",
-            ida_typeinf.BTMT_BOOL4: "_BOOL32"
-        }
-        size = Type.getLength()
+        size = TypeFlags.getLength()
+        if size == 2:
+            if self.__IsX86_64():
+                return "_BOOL64"
+            else:
+                return "_BOOL16"
+            
         return f"_BOOL{size*8}"
+        
 
     def __GetFloatType(self, Type):
         size = Type.getLength()
@@ -870,6 +913,9 @@ class TypeExtractor:
             result = f"{return_type} {calling_convention}{final_params}"
 
         return result
+    
+    def __IsX86_64(self):
+        return getCurrentProgram().getDefaultPointerSize() == 8
 
 
 
@@ -889,6 +935,8 @@ class SymbolExtractor():
                 
                 
             for sym in symIter:
+                if sym.getSymbolType().toString() == "Label":
+                    continue
                 effectiveAddress = sym.getAddress()
                 if effectiveAddress.getAddressSpace() != imageBase.getAddressSpace():
                     continue
@@ -947,13 +995,14 @@ class SymbolExtractor():
                 
                 
         
-                demangled_name = self.__tryDemangle(sym)
-                if not demangled_name:
-                    continue
+                #demangled_name = self.__tryDemangle(sym)
+                #if not demangled_name:
+                #    continue
 
                 # Определяем примерный размер/тип:
                 (typeName, size) = self.__detectDataType(program, effectiveAddress)
-
+                if typeName is None or size == 0:
+                    continue
                 if not typeName and size in [1,2,4,8]:
                     # Аналог из IDA: unsigned __intX
                     if size == 1: 
@@ -968,7 +1017,7 @@ class SymbolExtractor():
 
                 symbolData = PdbGeneratorPy.GlobalSymbolData()
                 symbolData.RelativeAddress = effectiveAddress.getOffset() - imageBase
-                symbolData.ShortName = demangled_name
+                symbolData.ShortName = sym.getName()
                 symbolData.TypeName = typeName
 
                 globalSymbolsData.append(symbolData)
@@ -1047,8 +1096,9 @@ def CbGeneratePdb():
     clear_console()
     program = getCurrentProgram()
     
-    
-    
+    peDataExtractor = PEDataExtractor()
+    pdbInfo = peDataExtractor.GetPdbInfo()
+    sectionsData = peDataExtractor.GetSectionsData()
     typeExtractor = TypeExtractor()
     typeExtractor.GatherData()
     symbolExtractor = SymbolExtractor(typeExtractor)
@@ -1056,19 +1106,22 @@ def CbGeneratePdb():
     globalSymbolsData = symbolExtractor.GetGlobals()
     functionDataExtractor = FunctionDataExtractor(typeExtractor)
     functionsData = functionDataExtractor.GetFunctionsData()
-    for func in functionsData:
-        print(f"ID: {func.FunctionName}, Name: {func.TypeName}")
     
     enumsData = typeExtractor.GetEnumsData()
     structsData = typeExtractor.GetStructsData()
     complexTypes = typeExtractor.GetComplexTypesData()
-    for struct in structsData:
-        print(f"\nKind: {struct.Kind} Name: {struct.Name} Size: {struct.StructSize}")
-        for member in struct.Members:
-            print(f"\tMemberName: {member.Name} typeName: {member.TypeName} Offset: {member.Offset} Bitfield {member.Bitfield}")
-    peDataExtractor = PEDataExtractor()
-    pdbInfo = peDataExtractor.GetPdbInfo()
-    sectionsData = peDataExtractor.GetSectionsData()
+
+    #for funcData in functionsData:
+    #    print(f"Name: {funcData.TypeName}")
+    #    for variable in funcData.LocalVariables:
+    #        print(f"\t Name {variable.Name} Type: {variable.TypeName}")
+    #for struct in structsData:
+    #    print(f"\nKind: {struct.Kind} Name: {struct.Name} Size: {struct.StructSize}")
+    #    for member in struct.Members:
+    #        print(f"\tMemberName: {member.Name} typeName: {member.TypeName} Offset: {member.Offset} Bitfield {member.Bitfield}")
+    
+    
+    
     if len(sectionsData) == 0:
         print("[SourceSync] Failed to get sections")       
         return
@@ -1077,13 +1130,15 @@ def CbGeneratePdb():
         cpuArchitectureType = PdbGeneratorPy.CpuArchitectureType.X86_64
     else:
         cpuArchitectureType = PdbGeneratorPy.CpuArchitectureType.X86  
-    
     pdbGenerator = PdbGeneratorPy.PdbGenerator(
-            complexTypes, structsData, enumsData, functionsData,
-            pdbInfo, sectionsData, publicSymbolsData, globalSymbolsData, cpuArchitectureType)
-    
+    complexTypes, structsData, enumsData, functionsData,
+    pdbInfo, sectionsData, publicSymbolsData, globalSymbolsData, cpuArchitectureType)
+    exePath = getCurrentProgram().getExecutablePath()[1:] # Вернет путь к файлу вида C:\\Test\\test.exe
+    pdbSource = os.path.join(os.getcwd(), os.path.splitext(os.path.basename(exePath))[0] + '.pdb')
+    pdbDestination = getOutputPath()  /  str(os.path.splitext(os.path.basename(exePath))[0] + '.pdb')
     if pdbGenerator.Generate():
-        print("[SourceSync] Pdb generated")       
+        shutil.move(pdbSource,pdbDestination)
+        print(f"[SourceSync] Pdb generated in {pdbDestination}")       
     else:
         print("[SourceSync] Failed to generate pdb")
     
