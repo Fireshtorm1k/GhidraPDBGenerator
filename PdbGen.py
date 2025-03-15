@@ -8,33 +8,24 @@
 import PdbGeneratorPy
 import re
 import uuid
-import windows.generated_def as windef
 import ctypes
 import pefile
 import os
 import shutil
+
 from dataclasses import dataclass
 from pathlib import Path
 
-from java.lang import String
 from java.util import ArrayList
-from ghidra.program.model.listing import Program
-from ghidra.app.util.opinion import PeLoader
-from ghidra.app.util.bin import MemoryByteProvider
 from ghidra.app.services import ConsoleService
 from ghidra.program.model.data import Undefined as GhidraUndefined
 from ghidra.program.model.data import *
-from ghidra.program.model.symbol import SymbolType, NameTransformer
-from ghidra.app.decompiler import DecompInterface, ClangLine, ClangStatement, ClangTokenGroup, PrettyPrinter
+from ghidra.program.model.symbol import SymbolType
+from ghidra.app.decompiler import DecompInterface, PrettyPrinter, ClangCommentToken
 from ghidra.app.cmd.label import DemanglerCmd
 from ghidra.app.util.demangler import DemanglerOptions
-from ghidra.app.util.bin.format.pdb import PdbParserConstants
-from ghidra.app.util.bin.format.pe import PortableExecutable, NTHeader
-from ghidra.util.task import ConsoleTaskMonitor
-from ghidra.framework.options import Options
 import struct
 # Константы
-complexDataTypesPython = {}
 IMAGE_DIRECTORY_ENTRY_DEBUG = 6
 IMAGE_DEBUG_TYPE_CODEVIEW = 2
 
@@ -147,26 +138,6 @@ class PEDataExtractor():
         
         return None
 
-def merge_ranges(ranges):
-    """ Объединяет пересекающиеся и смежные диапазоны """
-    if not ranges:
-        return []
-
-    # Сортируем диапазоны по начальному адресу
-    ranges.sort()
-
-    merged = []
-    cur_min, cur_max = ranges[0]
-
-    for min_addr, max_addr in ranges[1:]:
-        if min_addr.getOffset() <= cur_max.getOffset() + 1:  # Если диапазоны пересекаются или смежные
-            cur_max = max(cur_max, max_addr)
-        else:
-            merged.append((cur_min, cur_max))
-            cur_min, cur_max = min_addr, max_addr
-
-    merged.append((cur_min, cur_max))
-    return merged
 
 
 def clear_console():
@@ -216,9 +187,8 @@ class FunctionDataExtractor:
         decompiler = DecompInterface()
         decompiler.openProgram(program)
         functionsData = PdbGeneratorPy.FunctionsData()
-        
         functionManager = program.getFunctionManager()
-        for functionEa in functionManager.getFunctions(True):
+        for functionEa in functionManager.getFunctions(True):            
             functionData = self.GetFunctionData(functionEa, decompiler)
             if functionData:
                 functionsData.append(functionData)
@@ -229,13 +199,12 @@ class FunctionDataExtractor:
         functionData = PdbGeneratorPy.FunctionData()
         program = getCurrentProgram()
         imageBase = program.getImageBase()
-        
         def GetFunctionDataInternal():
             if function.isThunk():
                 return
             funcNameSpace = function.getParentNamespace().getName()
             if funcNameSpace != "Global" and funcNameSpace is not None:
-                funcName = f"{funcNameSpace}_{function.getName()}"
+                funcName = f"{funcNameSpace}::{function.getName()}"
             else:
                 funcName = function.getName()
             body = function.getBody()
@@ -304,8 +273,6 @@ class FunctionDataExtractor:
         entryAddr = function.getEntryPoint()
         lines = printer.getLines()
         
-        ranges = []
-        discardedRanges = []
         isInFunc = False
         for line in lines:
             lineNum = line.getLineNumber()
@@ -315,49 +282,46 @@ class FunctionDataExtractor:
                 isInFunc = True
                 continue
             if isInFunc:
+                instrVector = []
+                isComment = False
                 for token in line.getAllTokens():
-                    tokenMin = token.getMinAddress()
-                    tokenMax = token.getMaxAddress()
+                    if isinstance(token, ClangCommentToken):
+                        isComment = True
+                        break
+                    tokenMin = token.getMinAddress() 
                     if tokenMin:
-                        ranges.append((tokenMin, tokenMax))
-
-                        instrOffset = tokenMin.getOffset() - entryAddr.getOffset()
-                        if instrOffset < 0:
-                            continue
-                        
-                        instructionOffsetToPseudoCodeLines.insert(instrOffset, lineNum)
-        
+                        instrVector.append(tokenMin)
+                if isComment:
+                    continue
+                if len(instrVector) == 0: 
+                    continue
+                isCall = False
+                for instrAddr in instrVector:
+                   instruction = getInstructionAt(instrAddr)
+                   if instruction is None:
+                       continue
+                   if instruction.getMnemonicString().lower() in ["call", "callf"]:
+                       isCall = True
+                       callAddr = instrAddr.getOffset()
+                       break
+                #if isCall:
+                    #instrOffset = callAddr - entryAddr.getOffset()
+                #else:                    
+                    #instrOffset = (min(instrVector, key=lambda x: x.getOffset())).getOffset() - entryAddr.getOffset()
+                instrOffset = (min(instrVector, key=lambda x: x.getOffset())).getOffset() - entryAddr.getOffset()
+                if instrOffset < 0:
+                    continue
+                instructionOffsetToPseudoCodeLines.insert(instrOffset, lineNum)
         return instructionOffsetToPseudoCodeLines
-       
     
-    def __GetAddressOfInstructionForPseudoCodeLineMapping(self, RangeSet, DiscardedRanges, PseudoCodeLineNumber):
-        # We are looking for the first call instruction because sometimes the pseudocode line refers
-        # to non-contiguous assembly instructions, so mapping the pseudocode line
-        # to the first call instruction should be the most optimal solution
-        for index, addressRange in enumerate(RangeSet):
-            currentAddress = addressRange.start_ea
-            while currentAddress < addressRange.end_ea:
-                ins = ida_ua.insn_t()
-                if ida_ua.decode_insn(ins, currentAddress) == 0:
-                    break
-                
-                currentAddress += ins.size
+    
 
-                if ins.itype == ida_allins.NN_call or ins.itype == ida_allins.NN_callfi or ins.itype == ida_allins.NN_callni:
-                    return addressRange.start_ea
-
-            if index < RangeSet.nranges() - 1:
-                DiscardedRanges.append(DiscardedRange(addressRange.start_ea, addressRange.end_ea, PseudoCodeLineNumber))
-
-        # If there is no call instruction, return the first instruction from the last range
-        return RangeSet.lastrange().start_ea
 
     def __GetFunctionShadowSpaceArguments(self, DecompiledFunction, Function):
         shadowSpaceArguments = PdbGeneratorPy.LocalVariables()
         return shadowSpaceArguments
 
     def __GetFunctionLocalVariables(self, HighFunction, Function):
-        highNames = []
         symbolMap = HighFunction.getLocalSymbolMap()
         #lvars = Function.getAllVariables()
         lvars = symbolMap.getSymbols()
@@ -417,7 +381,7 @@ class FunctionDataExtractor:
     def __CreateFilePath(self, FunctionName):
         # Characters '?' and ':' are illegal to use inside file name so replace them
         FunctionName = FunctionName.replace("?", "!")
-        FunctionName = FunctionName.replace("::", "+")
+        FunctionName = FunctionName.replace("::", "_")
         INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
         if INVALID_FILENAME_CHARS.search(FunctionName):
             FunctionName = str(uuid.uuid1())
@@ -437,74 +401,6 @@ class FunctionDataExtractor:
     def __IsX86_64(self):
         return getCurrentProgram().getDefaultPointerSize() == 8
 
-
-    def getAllClangLineNodes(self, function, decompileResults):
-        instructionOffsetToPseudoCodeLines = PdbGeneratorPy.InstructionsToLines()
-        printer = PrettyPrinter(function, decompileResults.getCCodeMarkup(), None)
-        entryAddr = function.getEntryPoint()
-        lines = printer.getLines()
-        
-        ranges = []
-        discardedRanges = []
-        isInFunc = False
-        for line in lines:
-            lineNum = line.getLineNumber()
-            
-            if '{' in line.toString() and isInFunc == False:
-                instructionOffsetToPseudoCodeLines.insert(0, lineNum)
-                isInFunc = True
-                continue
-            if isInFunc:
-                for token in line.getAllTokens():
-                    tokenMin = token.getMinAddress()
-                    tokenMax = token.getMaxAddress()
-                    if tokenMin:
-                        ranges.append((tokenMin, tokenMax))
-
-                        instrOffset = tokenMin.getOffset() - entryAddr.getOffset()
-                        if instrOffset < 0:
-                            continue
-                        
-                        instructionOffsetToPseudoCodeLines.insert(instrOffset, lineNum)
-        '''
-        merged_ranges = merge_ranges(ranges)
-
-        for start, end in merged_ranges:
-            addr = self.get_call_instruction_address([(start, end)])
-            if addr is None:
-                discardedRanges.append((start, end))
-            else:
-                instrOffset = addr.getOffset() - entryAddr.getOffset()
-                if instrOffset >= 0:
-                    instructionOffsetToPseudoCodeLines.insert(instrOffset, lineNum)
-
-        for start, end in discardedRanges:
-            next_instr = instructionOffsetToPseudoCodeLines.get(end.getOffset() - entryAddr.getOffset())
-            if next_instr is not None:
-                dist = next_instr - start.getOffset()
-                if dist == 1:
-                    instructionOffsetToPseudoCodeLines.update_key(end.getOffset() - entryAddr.getOffset(),
-                                                                start.getOffset() - entryAddr.getOffset())
-        
-        if not lines[0]:
-            for index, line in enumerate(lines):
-                if line.getText().startswith("{"):
-                    instructionOffsetToPseudoCodeLines.insert(0, index + 1)
-                    break
-        '''
-        return instructionOffsetToPseudoCodeLines
-    
-    def get_call_instruction_address(self, ranges):
-        for start, end in ranges:
-            addr = start
-            while addr < end:
-                instr = getInstructionAt(addr)
-                if not instr:
-                    break
-                if instr.getMnemonicString() in ["CALL", "CALLF"]:  # Поиск инструкций вызова
-                    return start
-                addr = addr.add(instr.getLength())
-        return None
 
 
 
