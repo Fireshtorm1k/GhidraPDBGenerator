@@ -609,8 +609,6 @@ class TypeExtractor:
     def __CreateMember(self, UdtMember):
         memberDataType = UdtMember.getDataType()
         self.InsertTypeInfoData(memberDataType)
-        if UdtMember.getFieldName() == "ExceptionAddress":
-            n = 2
         if UdtMember.isBitFieldComponent():
             return self.__CreateBitfieldMember(UdtMember)
         else:
@@ -637,8 +635,6 @@ class TypeExtractor:
     def __CreateSimpleTypeMember(self, UdtMember):
         name = UdtMember.getFieldName()
         member = PdbGeneratorPy.MemberData()
-        if name == None:
-            n = 2
         member.Name = "field_" + hex(UdtMember.getOffset()) if name == None else name
         member.TypeName = self.GetTypeName(UdtMember.getDataType())
         member.Offset = UdtMember.getOffset()
@@ -671,6 +667,11 @@ class TypeExtractor:
         baseTypeType = None
         if isinstance(baseType, Pointer):
             baseTypeType = baseType.getDataType()
+        if isinstance(baseType, Array):
+            baseTypeType = unwrapTypedef(baseType.getDataType())
+            simpleType = self.__GetSimpleType(baseTypeType)
+            arrLen = baseType.getLength()
+            result = f"{simpleType}[{arrLen}]"
         
         if isinstance(baseType, FunctionDefinition):
             prototypeStr = baseType.getPrototypeString()
@@ -729,6 +730,8 @@ class TypeExtractor:
     
     def __GetUnknownType(self, Type):
         size = Type.getLength()
+        if size == 1:
+            return "unsigned char"
         return f"unsigned __int{size*8}" 
 
     def __GetVoidType(self, TypeFlags):
@@ -1011,15 +1014,6 @@ def CbGeneratePdb():
     enumsData = typeExtractor.GetEnumsData()
     structsData = typeExtractor.GetStructsData()
     complexTypes = typeExtractor.GetComplexTypesData()
-
-    #for funcData in functionsData:
-    #    print(f"Name: {funcData.TypeName}")
-    #    for variable in funcData.LocalVariables:
-    #        print(f"\t Name {variable.Name} Type: {variable.TypeName}")
-    #for struct in structsData:
-    #    print(f"\nKind: {struct.Kind} Name: {struct.Name} Size: {struct.StructSize}")
-    #    for member in struct.Members:
-    #        print(f"\tMemberName: {member.Name} typeName: {member.TypeName} Offset: {member.Offset} Bitfield {member.Bitfield}")
     
     
     
