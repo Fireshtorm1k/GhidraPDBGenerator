@@ -737,6 +737,11 @@ class TypeExtractor:
     def __GetIntegerType(self, Type):
         size = Type.getLength()
         isSigned = Type.isSigned()
+        if isinstance(Type, CharDataType):
+            if isSigned:
+                return "char"
+            else:
+                return "unsigned char"
         if not isSigned:
             return f"unsigned __int{size*8}" 
 
